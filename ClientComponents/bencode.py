@@ -1,6 +1,6 @@
 """
 Bencode encoder/decoder for BitTorrent protocol.
-Bencode is the encoding used by BitTorrent for storing and transmitting loosely structured data.
+This module handles converting Python objects to and from bencode format—BitTorrent's way of storing and passing data around.
 """
 
 import io
@@ -8,24 +8,24 @@ from collections import OrderedDict
 
 
 class BencodeError(Exception):
-    """Base exception for bencode errors."""
+    """General exception for bencode problems."""
     pass
 
 
 class BencodeDecodeError(BencodeError):
-    """Exception raised when decoding fails."""
+    """Raised when decoding bencode fails."""
     pass
 
 
 def encode(obj):
     """
-    Encode a Python object into bencode format.
+    Turn a Python object into bencode bytes.
     
     Args:
-        obj: Python object to encode (int, bytes, list, dict)
+        obj: What we're encoding (int, bytes, list, dict)
         
     Returns:
-        bytes: Bencoded representation
+        bytes: The bencoded output
     """
     if isinstance(obj, int):
         return f"i{obj}e".encode()
@@ -42,7 +42,7 @@ def encode(obj):
         return result
     elif isinstance(obj, dict):
         result = b"d"
-        # Sort keys to ensure consistent encoding
+        # Always sort keys for consistent output
         for key in sorted(obj.keys()):
             if isinstance(key, str):
                 key_bytes = key.encode('utf-8')
@@ -58,13 +58,13 @@ def encode(obj):
 
 def decode(data):
     """
-    Decode bencode data into Python objects.
+    Decode bencoded bytes back into Python objects.
     
     Args:
         data: bytes or file-like object containing bencoded data
         
     Returns:
-        Decoded Python object
+        The decoded object
     """
     if isinstance(data, bytes):
         data = io.BytesIO(data)
@@ -73,22 +73,22 @@ def decode(data):
 
 
 def _decode_recursive(data):
-    """Recursively decode bencode data from a file-like object."""
+    """Handles the core logic for parsing bencoded data from a stream."""
     marker = data.read(1)
     if not marker:
         raise BencodeDecodeError("Unexpected end of data")
     
     if marker == b'i':
-        # Integer
+        # Looks like an integer
         return _decode_int(data)
     elif marker == b'l':
-        # List
+        # List coming up
         return _decode_list(data)
     elif marker == b'd':
-        # Dictionary
+        # Dictionary incoming
         return _decode_dict(data)
     elif marker.isdigit():
-        # String
+        # This is a string
         return _decode_string(data, marker)
     else:
         raise BencodeDecodeError(f"Invalid marker: {marker}")
@@ -117,7 +117,7 @@ def _decode_int(data):
 
 def _decode_string(data, first_digit):
     """Decode a bencoded string."""
-    # Read the length
+    # Figure out how long the string is
     length_str = first_digit
     while True:
         char = data.read(1)
@@ -132,7 +132,7 @@ def _decode_string(data, first_digit):
     except ValueError:
         raise BencodeDecodeError(f"Invalid string length: {length_str}")
     
-    # Read the string data
+    # Now grab the actual string data
     string_data = data.read(length)
     if len(string_data) != length:
         raise BencodeDecodeError("Unexpected end of string")
@@ -150,7 +150,7 @@ def _decode_list(data):
         if not marker:
             raise BencodeDecodeError("Unexpected end of list")
         
-        # Put the marker back
+        # Put the marker back for recursion
         data.seek(data.tell() - 1)
         result.append(_decode_recursive(data))
     
@@ -167,18 +167,18 @@ def _decode_dict(data):
         if not marker:
             raise BencodeDecodeError("Unexpected end of dictionary")
         
-        # Put the marker back
+        # Put the marker back for recursion
         data.seek(data.tell() - 1)
         
-        # Decode key (must be a string)
+        # Keys have to be strings
         key = _decode_recursive(data)
         if not isinstance(key, bytes):
             raise BencodeDecodeError("Dictionary keys must be strings")
         
-        # Decode value
+        # Now the value
         value = _decode_recursive(data)
         
-        # Store with decoded key
+        # Try to decode key for easier use
         try:
             key_str = key.decode('utf-8')
         except UnicodeDecodeError:
@@ -189,20 +189,20 @@ def _decode_dict(data):
     return result
 
 
-# Convenience functions
+# Shortcuts for convenience
 def loads(data):
-    """Decode bencode data from bytes."""
+    """Handy alias for decoding bencode bytes."""
     return decode(data)
 
 
 def dumps(obj):
-    """Encode object to bencode bytes."""
+    """Handy alias for encoding objects to bencode."""
     return encode(obj)
 
 
-# Testing
+# Quick self-test
 if __name__ == "__main__":
-    # Test integer encoding/decoding
+    # Integer encoding/decoding checks
     assert encode(42) == b'i42e'
     assert decode(b'i42e') == 42
     assert encode(-42) == b'i-42e'
@@ -210,23 +210,23 @@ if __name__ == "__main__":
     assert encode(0) == b'i0e'
     assert decode(b'i0e') == 0
     
-    # Test string encoding/decoding
+    # String tests
     assert encode(b'hello') == b'5:hello'
     assert decode(b'5:hello') == b'hello'
     assert encode('hello') == b'5:hello'
     
-    # Test list encoding/decoding
+    # List tests
     assert encode([1, b'hello', 2]) == b'li1e5:helloi2ee'
     assert decode(b'li1e5:helloi2ee') == [1, b'hello', 2]
     
-    # Test dictionary encoding/decoding
+    # Dictionary tests
     d = {'name': b'test', 'num': 42}
     encoded = encode(d)
     decoded = decode(encoded)
     assert decoded['name'] == b'test'
     assert decoded['num'] == 42
     
-    # Test nested structures
+    # Nested structure checks
     nested = {'list': [1, 2, {'inner': b'value'}], 'number': 100}
     encoded = encode(nested)
     decoded = decode(encoded)
