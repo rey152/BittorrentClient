@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
-Command-line interface for the BitTorrent client.
+BitTorrent client command-line interface.
+This is the entry point for users to interact with the client—download torrents, create new ones, or inspect torrent files.
 """
 
 import asyncio
@@ -16,24 +17,23 @@ from torrent import create_torrent
 
 
 def setup_logging(verbose=False):
-    """Set up logging configuration."""
+    """Set up logging. Use more details if verbose is True."""
     level = logging.DEBUG if verbose else logging.INFO
     
-    # Configure root logger
     logging.basicConfig(
         level=level,
         format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
         datefmt='%Y-%m-%d %H:%M:%S'
     )
     
-    # Quiet some noisy loggers
+    # Quiet down some noisy loggers unless user wants full info
     if not verbose:
         logging.getLogger('asyncio').setLevel(logging.WARNING)
         logging.getLogger('dht').setLevel(logging.WARNING)
 
 
 def format_size(size):
-    """Format size in bytes to human readable format."""
+    """Turn a byte count into something readable (KB, MB, etc)."""
     for unit in ['B', 'KB', 'MB', 'GB', 'TB']:
         if size < 1024.0:
             return f"{size:.2f} {unit}"
@@ -42,12 +42,12 @@ def format_size(size):
 
 
 def format_speed(speed):
-    """Format speed in bytes/sec to human readable format."""
+    """Show speed in nice format."""
     return format_size(speed) + "/s"
 
 
 async def download_torrent(args):
-    """Download a torrent file."""
+    """Handle downloading a torrent file based on CLI arguments."""
     client = TorrentClient(
         download_dir=args.download_dir,
         port=args.port
@@ -56,7 +56,7 @@ async def download_torrent(args):
     try:
         await client.start()
         
-        # Add torrent
+        # Start the download
         print(f"Loading torrent: {args.torrent}")
         download = await client.add_torrent(args.torrent)
         
@@ -65,13 +65,13 @@ async def download_torrent(args):
         print(f"Pieces: {download.torrent.num_pieces}")
         print("")
         
-        # Monitor progress
+        # Keep an eye on progress
         last_progress = -1
         while not download.is_complete():
             stats = download.get_stats()
             progress = int(stats['progress'] * 100)
             
-            # Update display
+            # Update terminal only if things change or in verbose mode
             if progress != last_progress or args.verbose:
                 speed = stats.get('download_speed', 0)
                 peers = stats.get('peers', 0)
@@ -91,7 +91,7 @@ async def download_torrent(args):
         print(f"\n\nDownload complete!")
         print(f"Files saved to: {args.download_dir}")
         
-        # Continue seeding if requested
+        # If requested, keep seeding after download
         if args.seed:
             print("\nSeeding... Press Ctrl+C to stop")
             try:
@@ -116,31 +116,30 @@ async def download_torrent(args):
 
 
 async def create_torrent_file(args):
-    """Create a new torrent file."""
+    """Create a new .torrent file from user input."""
     print(f"Creating torrent for: {args.path}")
     
-    # Parse trackers
+    # Parse trackers from user arguments
     trackers = []
     if args.trackers:
         for tracker in args.trackers:
             if ',' in tracker:
-                # Multiple trackers in one tier
+                # Treat comma as a tier separator
                 trackers.append(tracker.split(','))
             else:
-                # Single tracker
                 trackers.append([tracker])
     
     try:
-        # Create torrent
+        # Actually build the torrent
         torrent = create_torrent(
             args.path,
-            piece_length=args.piece_length * 1024,  # Convert KB to bytes
+            piece_length=args.piece_length * 1024,  # KB to bytes
             private=args.private,
             trackers=trackers,
             comment=args.comment
         )
         
-        # Save torrent file
+        # Figure out where to write the .torrent file
         output_path = args.output or f"{Path(args.path).name}.torrent"
         torrent.save(output_path)
         
@@ -162,7 +161,7 @@ async def create_torrent_file(args):
 
 
 async def show_info(args):
-    """Show information about a torrent file."""
+    """Show details about a .torrent file."""
     try:
         from torrent import Torrent
         
@@ -214,7 +213,7 @@ async def show_info(args):
 
 
 def main():
-    """Main entry point."""
+    """Main entry for the CLI. Handles parsing arguments and dispatching commands."""
     parser = argparse.ArgumentParser(
         description='BitTorrent Client CLI',
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -277,7 +276,7 @@ Examples:
     # Set up logging
     setup_logging(args.verbose)
     
-    # Run appropriate command
+    # Figure out what command the user wants
     if args.command == 'download':
         asyncio.run(download_torrent(args))
     elif args.command == 'create':
