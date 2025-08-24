@@ -1,6 +1,6 @@
 """
 Torrent file parser for BitTorrent client.
-Handles parsing .torrent files and extracting all necessary metadata.
+This module takes care of reading .torrent files and pulling out all the important details we need to download and share files.
 """
 
 import hashlib
@@ -12,22 +12,22 @@ from bencode import decode, encode
 
 
 class TorrentError(Exception):
-    """Base exception for torrent-related errors."""
+    """Any general problem with parsing or handling a torrent file."""
     pass
 
 
 class Torrent:
-    """Represents a parsed torrent file with all its metadata."""
+    """Represents a parsed torrent file and all its metadata."""
     
     def __init__(self, torrent_data):
         """
-        Initialize a Torrent object from torrent file data.
+        Load a torrent file and grab its metadata.
         
         Args:
-            torrent_data: Raw bytes of the torrent file or path to torrent file
+            torrent_data: Raw bytes of torrent file or a path to the file.
         """
         if isinstance(torrent_data, str):
-            # It's a file path
+            # User passed a file path
             with open(torrent_data, 'rb') as f:
                 torrent_data = f.read()
         
@@ -35,34 +35,33 @@ class Torrent:
         self.meta_info = decode(torrent_data)
         
         if not isinstance(self.meta_info, dict):
-            raise TorrentError("Invalid torrent file: root must be a dictionary")
+            raise TorrentError("Invalid torrent file: root should be a dictionary")
         
         if 'info' not in self.meta_info:
-            raise TorrentError("Invalid torrent file: missing 'info' dictionary")
+            raise TorrentError("Torrent file missing 'info' dictionary")
         
         self.info = self.meta_info['info']
         self._calculate_info_hash()
         self._parse_metadata()
     
     def _calculate_info_hash(self):
-        """Calculate the SHA1 hash of the info dictionary."""
+        """Get the SHA1 hash for the info dictionary (used in peer/tracker communication)."""
         info_encoded = encode(self.info)
         self.info_hash = hashlib.sha1(info_encoded).digest()
         self.info_hash_hex = self.info_hash.hex()
     
     def _parse_metadata(self):
-        """Parse all metadata from the torrent file."""
-        # Basic info
+        """Read all the metadata fields from the torrent."""
         self.name = self.info.get('name', b'').decode('utf-8', errors='replace')
         self.piece_length = self.info.get('piece length', 0)
         
         if 'pieces' not in self.info:
-            raise TorrentError("Invalid torrent: missing piece hashes")
+            raise TorrentError("Torrent missing piece hashes")
         
-        # Parse piece hashes (20 bytes each)
+        # Split the big piece hash string into actual 20-byte hashes
         pieces_data = self.info['pieces']
         if len(pieces_data) % 20 != 0:
-            raise TorrentError("Invalid piece hashes length")
+            raise TorrentError("Piece hash section is the wrong size")
         
         self.piece_hashes = []
         for i in range(0, len(pieces_data), 20):
@@ -70,9 +69,8 @@ class Torrent:
         
         self.num_pieces = len(self.piece_hashes)
         
-        # Parse file information
+        # Single-file or multi-file torrent?
         if 'length' in self.info:
-            # Single file torrent
             self.is_multi_file = False
             self.total_size = self.info['length']
             self.files = [{
@@ -81,7 +79,7 @@ class Torrent:
                 'offset': 0
             }]
         else:
-            # Multi-file torrent
+            # Handle multi-file torrents
             self.is_multi_file = True
             self.files = []
             offset = 0
@@ -91,7 +89,7 @@ class Torrent:
             
             for file_info in self.info['files']:
                 if 'length' not in file_info or 'path' not in file_info:
-                    raise TorrentError("Invalid file entry in torrent")
+                    raise TorrentError("Bad file entry in torrent")
                 
                 path_parts = []
                 for part in file_info['path']:
@@ -109,7 +107,7 @@ class Torrent:
             
             self.total_size = offset
         
-        # Parse tracker information
+        # Tracker info
         self.announce = self.meta_info.get('announce', b'').decode('utf-8', errors='replace')
         self.announce_list = []
         
@@ -140,20 +138,20 @@ class Torrent:
         # Private flag
         self.private = bool(self.info.get('private', 0))
         
-        # Calculate last piece size
+        # Figure out size of the last piece
         self.last_piece_size = self.total_size % self.piece_length
         if self.last_piece_size == 0:
             self.last_piece_size = self.piece_length
     
     def _decode_optional_string(self, key):
-        """Safely decode an optional string field."""
+        """Try to decode a string field from the torrent, if present."""
         value = self.meta_info.get(key, b'')
         if isinstance(value, bytes):
             return value.decode('utf-8', errors='replace')
         return str(value) if value else ''
     
     def get_piece_size(self, piece_index):
-        """Get the size of a specific piece."""
+        """Return the size of a particular piece."""
         if piece_index < 0 or piece_index >= self.num_pieces:
             raise ValueError(f"Invalid piece index: {piece_index}")
         
@@ -162,7 +160,7 @@ class Torrent:
         return self.piece_length
     
     def get_file_piece_range(self, file_index):
-        """Get the range of pieces that contain a specific file."""
+        """Figure out which pieces contain the given file."""
         if file_index < 0 or file_index >= len(self.files):
             raise ValueError(f"Invalid file index: {file_index}")
         
@@ -176,7 +174,7 @@ class Torrent:
         return start_piece, end_piece
     
     def get_piece_file_ranges(self, piece_index):
-        """Get the files and byte ranges that a piece covers."""
+        """List the files and byte ranges that a given piece covers."""
         if piece_index < 0 or piece_index >= self.num_pieces:
             raise ValueError(f"Invalid piece index: {piece_index}")
         
@@ -190,13 +188,13 @@ class Torrent:
             file_start = file_info['offset']
             file_end = file_start + file_info['length'] - 1
             
-            # Check if this file overlaps with the piece
+            # Does this file touch our piece?
             if file_start <= piece_end and file_end >= piece_start:
-                # Calculate the overlap
+                # Calculate where they overlap
                 overlap_start = max(piece_start, file_start)
                 overlap_end = min(piece_end, file_end)
                 
-                # Convert to file-relative offsets
+                # Figure out offsets relative to file and piece
                 file_offset = overlap_start - file_start
                 length = overlap_end - overlap_start + 1
                 
@@ -210,22 +208,17 @@ class Torrent:
         return file_ranges
     
     def get_magnet_link(self):
-        """Generate a magnet link for this torrent."""
+        """Build a magnet link for this torrent."""
         params = []
-        
-        # Add info hash
         params.append(f"xt=urn:btih:{self.info_hash_hex}")
         
-        # Add display name
         if self.name:
             params.append(f"dn={quote(self.name)}")
         
-        # Add trackers
         for tier in self.announce_list:
             for tracker in tier:
                 params.append(f"tr={quote(tracker)}")
         
-        # Add web seeds if available
         if 'url-list' in self.meta_info:
             for url in self.meta_info['url-list']:
                 if isinstance(url, bytes):
@@ -235,7 +228,7 @@ class Torrent:
         return "magnet:?" + "&".join(params)
     
     def __str__(self):
-        """String representation of the torrent."""
+        """Show a summary of the torrent."""
         files_str = f"{len(self.files)} files" if self.is_multi_file else "single file"
         return (f"Torrent: {self.name}\n"
                 f"Info Hash: {self.info_hash_hex}\n"
@@ -245,49 +238,46 @@ class Torrent:
                 f"Private: {self.private}")
     
     def save(self, path):
-        """Save the torrent to a file."""
+        """Write the torrent file to disk."""
         with open(path, 'wb') as f:
             f.write(self.raw_data)
 
 
 def create_torrent(path, piece_length=524288, private=False, trackers=None, comment=None):
     """
-    Create a new torrent file from a file or directory.
+    Make a .torrent file from a folder or file.
     
     Args:
-        path: Path to file or directory to create torrent from
-        piece_length: Length of each piece in bytes (default 512KB)
-        private: Whether this is a private torrent
-        trackers: List of tracker URLs or list of lists for multiple tiers
-        comment: Optional comment string
+        path: Path to the file or directory
+        piece_length: Each piece size in bytes (default 512KB)
+        private: Set to True for a private torrent
+        trackers: List of tracker URLs (optionally list of lists for tiers)
+        comment: Optional comment for the torrent
         
     Returns:
-        Torrent object
+        Torrent object with all metadata ready
     """
     if not os.path.exists(path):
         raise ValueError(f"Path does not exist: {path}")
     
-    # Build file list
     files = []
     total_size = 0
     
     if os.path.isfile(path):
-        # Single file
+        # Just one file
         name = os.path.basename(path)
         size = os.path.getsize(path)
         files.append((path, [], size))
         total_size = size
     else:
-        # Directory
+        # It's a directory
         name = os.path.basename(os.path.abspath(path))
         for root, dirs, filenames in os.walk(path):
-            # Sort for consistent ordering
             dirs.sort()
             filenames.sort()
             
             for filename in filenames:
                 filepath = os.path.join(root, filename)
-                # Get path components relative to base directory
                 relpath = os.path.relpath(filepath, path)
                 path_parts = relpath.split(os.sep)
                 
@@ -298,7 +288,7 @@ def create_torrent(path, piece_length=524288, private=False, trackers=None, comm
     if not files:
         raise ValueError("No files found to create torrent")
     
-    # Calculate pieces
+    # Hash up all the file data into pieces
     num_pieces = (total_size + piece_length - 1) // piece_length
     pieces = b''
     
@@ -306,7 +296,6 @@ def create_torrent(path, piece_length=524288, private=False, trackers=None, comm
     for filepath, _, _ in files:
         with open(filepath, 'rb') as f:
             while True:
-                # Read enough to fill current piece
                 needed = piece_length - len(piece_buffer)
                 data = f.read(needed)
                 if not data:
@@ -314,16 +303,14 @@ def create_torrent(path, piece_length=524288, private=False, trackers=None, comm
                 
                 piece_buffer += data
                 
-                # If piece is complete, hash it
                 if len(piece_buffer) == piece_length:
                     pieces += hashlib.sha1(piece_buffer).digest()
                     piece_buffer = b''
     
-    # Hash final piece if there's remaining data
     if piece_buffer:
         pieces += hashlib.sha1(piece_buffer).digest()
     
-    # Build info dictionary
+    # Build info dictionary for the torrent
     info = {
         'name': name.encode('utf-8'),
         'piece length': piece_length,
@@ -334,10 +321,8 @@ def create_torrent(path, piece_length=524288, private=False, trackers=None, comm
         info['private'] = 1
     
     if len(files) == 1:
-        # Single file
         info['length'] = files[0][2]
     else:
-        # Multi-file
         info['files'] = []
         for _, path_parts, size in files:
             info['files'].append({
@@ -345,36 +330,29 @@ def create_torrent(path, piece_length=524288, private=False, trackers=None, comm
                 'length': size
             })
     
-    # Build meta info
     meta_info = {'info': info}
     
-    # Add trackers
     if trackers:
         if isinstance(trackers[0], list):
-            # Multiple tiers
             meta_info['announce-list'] = [[t.encode('utf-8') for t in tier] for tier in trackers]
             if trackers[0]:
                 meta_info['announce'] = trackers[0][0].encode('utf-8')
         else:
-            # Single tier
             meta_info['announce'] = trackers[0].encode('utf-8')
             meta_info['announce-list'] = [[t.encode('utf-8') for t in trackers]]
     
-    # Add optional fields
     if comment:
         meta_info['comment'] = comment.encode('utf-8')
     
     meta_info['created by'] = b'SimpleBittorrentClient/1.0'
     meta_info['creation date'] = int(datetime.now().timestamp())
     
-    # Encode and create torrent object
     torrent_data = encode(meta_info)
     return Torrent(torrent_data)
 
 
-# Testing
+# Quick test/demo
 if __name__ == "__main__":
-    # Test with a simple torrent structure
     test_info = {
         'name': b'test.txt',
         'piece length': 16384,
@@ -390,11 +368,8 @@ if __name__ == "__main__":
         'created by': b'SimpleBittorrentClient/1.0'
     }
     
-    # Encode the test torrent
     from bencode import encode
     torrent_data = encode(test_torrent)
-    
-    # Parse it
     torrent = Torrent(torrent_data)
     print(torrent)
     print(f"\nMagnet link: {torrent.get_magnet_link()}")
