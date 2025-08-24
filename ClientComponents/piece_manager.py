@@ -1,6 +1,6 @@
 """
 Piece manager for BitTorrent client.
-Handles piece selection, verification, storage, and block management.
+Handles which pieces to download, checks their integrity, and manages reading/writing pieces to disk.
 """
 
 import os
@@ -16,7 +16,7 @@ logger = logging.getLogger(__name__)
 
 
 class PieceState(Enum):
-    """State of a piece in the download process."""
+    """Describes where each piece is in the download process."""
     MISSING = 0
     PARTIAL = 1
     COMPLETE = 2
@@ -24,7 +24,7 @@ class PieceState(Enum):
 
 
 class Block:
-    """Represents a block within a piece."""
+    """Represents one block (chunk) in a piece."""
     
     def __init__(self, piece_index, offset, length):
         self.piece_index = piece_index
@@ -40,7 +40,7 @@ class Block:
 
 
 class Piece:
-    """Represents a piece in the torrent."""
+    """Represents a single piece in the torrent."""
     
     def __init__(self, index, length, hash_value):
         self.index = index
@@ -53,26 +53,26 @@ class Piece:
         self.last_seen = {}  # {peer_key: timestamp}
         
     def add_block(self, offset, data):
-        """Add block data to the piece."""
+        """Add a block of data to this piece."""
         end = offset + len(data)
         if end > self.length:
-            raise ValueError(f"Block exceeds piece boundary: {end} > {self.length}")
+            raise ValueError(f"Block is too large for piece: {end} > {self.length}")
         
         self.data[offset:end] = data
         self.blocks_received += 1
         
     def is_complete(self):
-        """Check if all blocks have been received."""
+        """Check if all blocks have been received for this piece."""
         total_blocks = sum(1 for b in self.blocks if b.received)
         return total_blocks == len(self.blocks)
     
     def verify(self):
-        """Verify piece hash."""
+        """Make sure the piece's data matches its hash."""
         piece_hash = hashlib.sha1(self.data).digest()
         return piece_hash == self.hash
     
     def reset(self):
-        """Reset piece to initial state."""
+        """Reset the piece back to its initial state."""
         self.state = PieceState.MISSING
         self.data = bytearray(self.length)
         self.blocks_received = 0
@@ -83,51 +83,47 @@ class Piece:
 
 
 class PieceManager:
-    """Manages piece downloading and storage."""
+    """Handles all the logic for which pieces to download and where to store them."""
     
-    BLOCK_SIZE = 16384  # 16 KB standard block size
-    REQUEST_TIMEOUT = 30  # Seconds before re-requesting a block
+    BLOCK_SIZE = 16384  # 16 KB per block, standard for BitTorrent
+    REQUEST_TIMEOUT = 30  # Seconds before a block is considered timed out
     
     def __init__(self, torrent, download_dir):
         """
-        Initialize piece manager.
+        Set up the piece manager for a given torrent and download directory.
         
         Args:
             torrent: Torrent object
-            download_dir: Directory to save downloaded files
+            download_dir: Where to save downloaded files
         """
         self.torrent = torrent
         self.download_dir = download_dir
         
-        # Initialize pieces
         self.pieces = {}
         self._initialize_pieces()
         
-        # Piece availability tracking
-        self.piece_availability = defaultdict(int)  # piece_index: peer_count
-        self.peer_pieces = defaultdict(set)  # peer_key: set of piece indices
+        # Track which pieces peers have
+        self.piece_availability = defaultdict(int)  # piece_index: number of peers
+        self.peer_pieces = defaultdict(set)  # peer_key: set of pieces
         
-        # Download state
         self.total_downloaded = 0
         self.total_uploaded = 0
         self.bitfield = self._create_bitfield()
         
-        # File handles
         self.file_handles = {}
         self._prepare_files()
         
-        # Statistics
         self.start_time = time.time()
         
     def _initialize_pieces(self):
-        """Initialize all pieces with their blocks."""
+        """Set up all pieces and their blocks."""
         for i in range(self.torrent.num_pieces):
             piece_length = self.torrent.get_piece_size(i)
             piece_hash = self.torrent.piece_hashes[i]
             
             piece = Piece(i, piece_length, piece_hash)
             
-            # Create blocks for this piece
+            # Break piece into blocks
             offset = 0
             while offset < piece_length:
                 block_length = min(self.BLOCK_SIZE, piece_length - offset)
@@ -138,11 +134,11 @@ class PieceManager:
             self.pieces[i] = piece
     
     def _create_bitfield(self):
-        """Create bitfield for pieces we have."""
+        """Make a bitfield for all pieces we've got."""
         num_bytes = (self.torrent.num_pieces + 7) // 8
         bitfield = bytearray(num_bytes)
         
-        # Check existing files for complete pieces
+        # Check if any pieces already exist and are valid on disk
         for i in range(self.torrent.num_pieces):
             if self._check_piece_on_disk(i):
                 self._set_piece_complete(i)
@@ -153,35 +149,31 @@ class PieceManager:
         return bitfield
     
     def _prepare_files(self):
-        """Prepare files for writing."""
+        """Make sure folders/files exist for writing pieces."""
         os.makedirs(self.download_dir, exist_ok=True)
         
         for file_info in self.torrent.files:
             file_path = os.path.join(self.download_dir, *file_info['path'])
             file_dir = os.path.dirname(file_path)
             
-            # Create directory if needed
             if file_dir:
                 os.makedirs(file_dir, exist_ok=True)
             
-            # Create/open file
             if not os.path.exists(file_path):
-                # Pre-allocate file space
+                # Pre-allocate full file size
                 with open(file_path, 'wb') as f:
                     f.seek(file_info['length'] - 1)
                     f.write(b'\0')
     
     def _check_piece_on_disk(self, piece_index):
-        """Check if a piece exists and is valid on disk."""
+        """See if a piece is already present and correct on disk."""
         piece = self.pieces[piece_index]
         
         try:
-            # Read piece data from file(s)
             piece_data = self._read_piece_from_disk(piece_index)
             if len(piece_data) != piece.length:
                 return False
             
-            # Verify hash
             piece_hash = hashlib.sha1(piece_data).digest()
             if piece_hash == piece.hash:
                 piece.data = bytearray(piece_data)
@@ -194,11 +186,10 @@ class PieceManager:
         return False
     
     def _read_piece_from_disk(self, piece_index):
-        """Read a piece from disk."""
+        """Load a piece from disk."""
         piece = self.pieces[piece_index]
         piece_data = bytearray()
         
-        # Get file ranges for this piece
         file_ranges = self.torrent.get_piece_file_ranges(piece_index)
         
         for file_range in file_ranges:
@@ -213,22 +204,18 @@ class PieceManager:
         return bytes(piece_data)
     
     def _write_piece_to_disk(self, piece_index):
-        """Write a verified piece to disk."""
+        """Write a verified piece back to its spot on disk."""
         piece = self.pieces[piece_index]
-        
-        # Get file ranges for this piece
         file_ranges = self.torrent.get_piece_file_ranges(piece_index)
         
         for file_range in file_ranges:
             file_info = self.torrent.files[file_range['file_index']]
             file_path = os.path.join(self.download_dir, *file_info['path'])
             
-            # Extract data for this file
             start = file_range['piece_offset']
             end = start + file_range['length']
             data = piece.data[start:end]
             
-            # Write to file
             with open(file_path, 'r+b') as f:
                 f.seek(file_range['file_offset'])
                 f.write(data)
@@ -236,15 +223,14 @@ class PieceManager:
         logger.info(f"Wrote piece {piece_index} to disk")
     
     def _set_piece_complete(self, piece_index):
-        """Mark a piece as complete in the bitfield."""
+        """Mark a piece as done in our bitfield."""
         byte_index = piece_index // 8
         bit_index = piece_index % 8
         self.bitfield[byte_index] |= (1 << (7 - bit_index))
     
     def update_peer_pieces(self, peer_key, bitfield=None, have_index=None):
-        """Update piece availability from peer."""
+        """Track which pieces a peer has, based on bitfield or HAVE messages."""
         if bitfield is not None:
-            # Process bitfield
             available_pieces = set()
             for i in range(min(len(bitfield) * 8, self.torrent.num_pieces)):
                 byte_index = i // 8
@@ -252,7 +238,6 @@ class PieceManager:
                 if bitfield[byte_index] & (1 << (7 - bit_index)):
                     available_pieces.add(i)
             
-            # Update availability counts
             old_pieces = self.peer_pieces.get(peer_key, set())
             for piece in old_pieces - available_pieces:
                 self.piece_availability[piece] -= 1
@@ -262,7 +247,6 @@ class PieceManager:
             self.peer_pieces[peer_key] = available_pieces
             
         elif have_index is not None:
-            # Process single have message
             if have_index < self.torrent.num_pieces:
                 if have_index not in self.peer_pieces[peer_key]:
                     self.peer_pieces[peer_key].add(have_index)
@@ -270,7 +254,7 @@ class PieceManager:
                     self.pieces[have_index].last_seen[peer_key] = time.time()
     
     def remove_peer(self, peer_key):
-        """Remove a peer and update availability."""
+        """Remove a peer's pieces from our tracking."""
         if peer_key in self.peer_pieces:
             for piece_index in self.peer_pieces[peer_key]:
                 self.piece_availability[piece_index] -= 1
@@ -278,18 +262,18 @@ class PieceManager:
     
     def get_next_block(self, peer_key, peer_pieces):
         """
-        Get the next block to request from a peer.
+        Figure out which block to ask for next from a peer.
         
         Args:
-            peer_key: (ip, port) tuple identifying the peer
-            peer_pieces: Set of piece indices the peer has
+            peer_key: Tuple identifying the peer
+            peer_pieces: Set of pieces the peer has
             
         Returns:
-            Block object or None if no suitable block found
+            Block object if there's something to request, otherwise None
         """
         current_time = time.time()
         
-        # Priority 1: Continue partially downloaded pieces
+        # First priority: keep working on any partial pieces
         incomplete_pieces = [
             p for p in self.pieces.values()
             if p.state == PieceState.PARTIAL and p.index in peer_pieces
@@ -303,11 +287,10 @@ class PieceManager:
                     return block
                 elif (block.requested and not block.received and 
                       current_time - block.requested_time > self.REQUEST_TIMEOUT):
-                    # Re-request timed out block
                     block.requested_time = current_time
                     return block
         
-        # Priority 2: Rarest pieces first
+        # Second: rarest pieces first
         missing_pieces = [
             (self.piece_availability.get(i, 0), i)
             for i in range(self.torrent.num_pieces)
@@ -315,21 +298,18 @@ class PieceManager:
         ]
         
         if missing_pieces:
-            # Sort by availability (rarest first), then randomize among equally rare
             missing_pieces.sort(key=lambda x: (x[0], random.random()))
             
             for _, piece_index in missing_pieces:
                 piece = self.pieces[piece_index]
                 piece.state = PieceState.PARTIAL
-                
-                # Request first block
                 if piece.blocks:
                     block = piece.blocks[0]
                     block.requested = True
                     block.requested_time = current_time
                     return block
         
-        # Priority 3: Endgame mode - request unreceived blocks from multiple peers
+        # Third: endgame mode—request unreceived blocks from multiple peers
         if self.get_progress() > 0.95:  # 95% complete
             for piece in self.pieces.values():
                 if piece.state == PieceState.PARTIAL and piece.index in peer_pieces:
@@ -341,15 +321,15 @@ class PieceManager:
     
     async def add_block(self, piece_index, offset, data):
         """
-        Add a received block to a piece.
+        Add a block we've just received.
         
         Args:
-            piece_index: Index of the piece
+            piece_index: Which piece
             offset: Offset within the piece
             data: Block data
             
         Returns:
-            True if piece is now complete and verified
+            True if the piece is now complete and verified, False otherwise
         """
         if piece_index >= self.torrent.num_pieces:
             logger.error(f"Invalid piece index: {piece_index}")
@@ -357,7 +337,6 @@ class PieceManager:
         
         piece = self.pieces[piece_index]
         
-        # Find the corresponding block
         block = None
         for b in piece.blocks:
             if b.offset == offset and b.length == len(data):
@@ -372,14 +351,12 @@ class PieceManager:
             logger.debug(f"Duplicate block received: piece {piece_index}, offset {offset}")
             return False
         
-        # Store block data
         block.data = data
         block.received = True
         piece.add_block(offset, data)
         
         self.total_downloaded += len(data)
         
-        # Check if piece is complete
         if piece.is_complete():
             if piece.verify():
                 piece.state = PieceState.VERIFIED
@@ -388,7 +365,6 @@ class PieceManager:
                 logger.info(f"Piece {piece_index} completed and verified")
                 return True
             else:
-                # Verification failed, reset piece
                 logger.error(f"Piece {piece_index} verification failed")
                 piece.reset()
                 return False
@@ -396,7 +372,7 @@ class PieceManager:
         return False
     
     def get_block_data(self, piece_index, offset, length):
-        """Get block data for uploading to peers."""
+        """Get block data for uploading to another peer."""
         if piece_index >= self.torrent.num_pieces:
             return None
         
@@ -407,27 +383,26 @@ class PieceManager:
         if offset + length > piece.length:
             return None
         
-        # Read from disk if piece data not in memory
         if not piece.data:
             piece.data = bytearray(self._read_piece_from_disk(piece_index))
         
         return bytes(piece.data[offset:offset + length])
     
     def get_progress(self):
-        """Get download progress as a fraction."""
+        """How much of the torrent have we finished?"""
         verified_pieces = sum(1 for p in self.pieces.values() 
                             if p.state == PieceState.VERIFIED)
         return verified_pieces / self.torrent.num_pieces
     
     def get_download_speed(self):
-        """Get current download speed in bytes per second."""
+        """Current download speed in bytes/sec."""
         elapsed = time.time() - self.start_time
         if elapsed > 0:
             return self.total_downloaded / elapsed
         return 0
     
     def get_stats(self):
-        """Get download statistics."""
+        """Stats for this download."""
         verified_pieces = sum(1 for p in self.pieces.values() 
                             if p.state == PieceState.VERIFIED)
         partial_pieces = sum(1 for p in self.pieces.values() 
@@ -444,16 +419,15 @@ class PieceManager:
         }
     
     def is_complete(self):
-        """Check if download is complete."""
+        """Are all pieces verified and present?"""
         return all(p.state == PieceState.VERIFIED for p in self.pieces.values())
     
     def get_needed_pieces(self):
-        """Get list of piece indices we still need."""
+        """List of pieces still missing or incomplete."""
         return [i for i, p in self.pieces.items() 
                 if p.state != PieceState.VERIFIED]
 
 
-# Testing
+# Test stub
 if __name__ == "__main__":
-    # This would require a real torrent object
     print("PieceManager module loaded")
