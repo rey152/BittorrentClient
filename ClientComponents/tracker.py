@@ -1,6 +1,6 @@
 """
 Tracker communication module for BitTorrent client.
-Handles both HTTP and UDP tracker protocols.
+Handles tracker communication for both HTTP and UDP trackers, so we can find peers for our torrents.
 """
 
 import random
@@ -15,12 +15,12 @@ from bencode import decode, encode
 
 
 class TrackerError(Exception):
-    """Base exception for tracker-related errors."""
+    """General exception for tracker-related errors."""
     pass
 
 
 class TrackerEvent(IntEnum):
-    """Tracker announce events."""
+    """Events to announce to a tracker."""
     NONE = 0
     COMPLETED = 1
     STARTED = 2
@@ -28,20 +28,20 @@ class TrackerEvent(IntEnum):
 
 
 class TrackerResponse:
-    """Represents a response from a tracker."""
+    """Represents what a tracker sends back—peer list, intervals, stats."""
     
     def __init__(self, peers, interval=1800, min_interval=None, 
                  tracker_id=None, complete=None, incomplete=None):
         self.peers = peers  # List of (ip, port) tuples
-        self.interval = interval  # Seconds until next announce
+        self.interval = interval  # How long to wait before next announce
         self.min_interval = min_interval or interval
         self.tracker_id = tracker_id
-        self.complete = complete  # Number of seeders
-        self.incomplete = incomplete  # Number of leechers
+        self.complete = complete  # Seeders count
+        self.incomplete = incomplete  # Leechers count
 
 
 class Tracker:
-    """Base class for tracker communication."""
+    """Base class for tracker communication—subclassed for HTTP or UDP."""
     
     def __init__(self, announce_url, torrent_info_hash, peer_id):
         self.announce_url = announce_url
@@ -51,12 +51,12 @@ class Tracker:
         
     def announce(self, uploaded, downloaded, left, event=TrackerEvent.NONE, 
                  port=6881, num_want=50):
-        """Announce to the tracker. Must be implemented by subclasses."""
+        """Announce to the tracker (must be implemented by subclass)."""
         raise NotImplementedError
 
 
 class HTTPTracker(Tracker):
-    """HTTP/HTTPS tracker implementation."""
+    """Implements HTTP/HTTPS tracker protocol."""
     
     def __init__(self, announce_url, torrent_info_hash, peer_id):
         super().__init__(announce_url, torrent_info_hash, peer_id)
@@ -67,7 +67,7 @@ class HTTPTracker(Tracker):
     
     def announce(self, uploaded, downloaded, left, event=TrackerEvent.NONE,
                  port=6881, num_want=50, compact=True):
-        """Send announce request to HTTP tracker."""
+        """Send an announce to HTTP tracker and parse response."""
         params = {
             'info_hash': self.info_hash,
             'peer_id': self.peer_id,
@@ -82,13 +82,12 @@ class HTTPTracker(Tracker):
         if event != TrackerEvent.NONE:
             params['event'] = event.name.lower()
         
-        # Build URL with raw info_hash and peer_id (they're already encoded)
+        # Build URL with info_hash and peer_id as raw bytes
         query_parts = []
         for key, value in params.items():
             if key in ('info_hash', 'peer_id'):
-                # These are raw bytes, need special handling
+                # URL encode raw bytes
                 if isinstance(value, bytes):
-                    # URL encode each byte
                     encoded = ''.join(f'%{b:02x}' for b in value)
                     query_parts.append(f'{key}={encoded}')
             else:
@@ -106,10 +105,10 @@ class HTTPTracker(Tracker):
             if b'failure reason' in data:
                 raise TrackerError(data[b'failure reason'].decode('utf-8', errors='replace'))
             
-            # Extract peer list
+            # Parse peer list
             peers = self._parse_peers(data.get(b'peers', b''), compact)
             
-            # Build response object
+            # Build the response object
             return TrackerResponse(
                 peers=peers,
                 interval=data.get(b'interval', 1800),
@@ -125,7 +124,7 @@ class HTTPTracker(Tracker):
             raise TrackerError(f"Failed to parse tracker response: {e}")
     
     def _parse_peers(self, peer_data, compact):
-        """Parse peer list from tracker response."""
+        """Parse peer list from tracker response (compact or non-compact)."""
         peers = []
         
         if compact and isinstance(peer_data, bytes):
@@ -140,7 +139,7 @@ class HTTPTracker(Tracker):
                     
                     peers.append((ip, port))
         elif isinstance(peer_data, list):
-            # Non-compact format: list of dictionaries
+            # Non-compact format: list of dicts
             for peer in peer_data:
                 if isinstance(peer, dict) and b'ip' in peer and b'port' in peer:
                     ip = peer[b'ip'].decode('utf-8', errors='replace')
@@ -151,15 +150,13 @@ class HTTPTracker(Tracker):
 
 
 class UDPTracker(Tracker):
-    """UDP tracker implementation (BEP 15)."""
+    """Implements UDP tracker protocol (BEP 15)."""
     
-    # UDP tracker actions
     ACTION_CONNECT = 0
     ACTION_ANNOUNCE = 1
     ACTION_SCRAPE = 2
     ACTION_ERROR = 3
     
-    # Magic constant for connection
     MAGIC_CONNECTION_ID = 0x41727101980
     
     def __init__(self, announce_url, torrent_info_hash, peer_id):
@@ -169,7 +166,7 @@ class UDPTracker(Tracker):
         self.socket = None
         
     def _create_socket(self):
-        """Create and configure UDP socket."""
+        """Create UDP socket for tracker communication."""
         if self.socket:
             self.socket.close()
         
@@ -177,7 +174,7 @@ class UDPTracker(Tracker):
         self.socket.settimeout(15)
     
     def _send_receive(self, data, host, port):
-        """Send data and receive response."""
+        """Send data and wait for response."""
         if not self.socket:
             self._create_socket()
         
@@ -190,14 +187,12 @@ class UDPTracker(Tracker):
             raise TrackerError("UDP tracker timeout")
     
     def _connect(self):
-        """Establish connection with UDP tracker."""
-        # Check if we have a valid connection
+        """Establish connection with UDP tracker, if needed."""
         if self.connection_id and time.time() < self.connection_expiry:
             return
         
         transaction_id = random.randint(0, 2**32 - 1)
         
-        # Build connect request
         request = struct.pack('!QII',
             self.MAGIC_CONNECTION_ID,  # connection_id
             self.ACTION_CONNECT,       # action
@@ -226,16 +221,13 @@ class UDPTracker(Tracker):
     def announce(self, uploaded, downloaded, left, event=TrackerEvent.NONE,
                  port=6881, num_want=50, key=None):
         """Send announce request to UDP tracker."""
-        # Ensure we're connected
         self._connect()
         
         transaction_id = random.randint(0, 2**32 - 1)
         
-        # Generate a key if not provided
         if key is None:
             key = random.randint(0, 2**32 - 1)
         
-        # Build announce request
         request = struct.pack('!QII20s20sQQQIIIIH',
             self.connection_id,     # connection_id
             self.ACTION_ANNOUNCE,   # action
@@ -260,11 +252,9 @@ class UDPTracker(Tracker):
         if len(response) < 20:
             raise TrackerError("Invalid announce response")
         
-        # Parse response header
         action, resp_transaction_id, interval, leechers, seeders = struct.unpack('!IIIII', response[:20])
         
         if action == self.ACTION_ERROR:
-            # Error response
             error_msg = response[8:].decode('utf-8', errors='replace')
             raise TrackerError(f"Tracker error: {error_msg}")
         
@@ -274,7 +264,7 @@ class UDPTracker(Tracker):
         if resp_transaction_id != transaction_id:
             raise TrackerError("Transaction ID mismatch")
         
-        # Parse peer list (compact format)
+        # Peer list in compact format
         peers = []
         peer_data = response[20:]
         
@@ -296,7 +286,7 @@ class UDPTracker(Tracker):
         )
     
     def close(self):
-        """Close the UDP socket."""
+        """Close UDP socket if open."""
         if self.socket:
             self.socket.close()
             self.socket = None
@@ -304,7 +294,7 @@ class UDPTracker(Tracker):
 
 def create_tracker(announce_url, info_hash, peer_id):
     """
-    Factory function to create appropriate tracker instance.
+    Make the right tracker object for the protocol (HTTP or UDP).
     
     Args:
         announce_url: Tracker announce URL
@@ -325,11 +315,11 @@ def create_tracker(announce_url, info_hash, peer_id):
 
 
 class TrackerManager:
-    """Manages multiple trackers for a torrent."""
+    """Handles all the trackers for a torrent."""
     
     def __init__(self, torrent, peer_id):
         """
-        Initialize tracker manager.
+        Set up tracker manager with all tiers and protocols.
         
         Args:
             torrent: Torrent object
@@ -355,13 +345,13 @@ class TrackerManager:
     def announce(self, uploaded, downloaded, left, event=TrackerEvent.NONE,
                  port=6881, num_want=50):
         """
-        Announce to trackers, trying each tier until success.
+        Announce to trackers, trying each tier until one responds.
         
         Returns:
             TrackerResponse or None if all trackers fail
         """
         for tier in self.trackers:
-            # Randomize tracker order within tier
+            # Shuffle trackers for load balancing
             tier_copy = tier.copy()
             random.shuffle(tier_copy)
             
@@ -374,10 +364,8 @@ class TrackerManager:
                 except Exception as e:
                     print(f"Tracker {tracker.announce_url} failed: {e}")
                     continue
-            
-            # If we got here, all trackers in this tier failed
-            # Continue to next tier
         
+        # If none responded, return None
         return None
     
     def close(self):
@@ -388,7 +376,7 @@ class TrackerManager:
                     tracker.close()
 
 
-# Testing
+# Test stub
 if __name__ == "__main__":
     # Generate test peer ID
     peer_id = b'-SB0100-' + bytes(random.randint(0, 255) for _ in range(12))
